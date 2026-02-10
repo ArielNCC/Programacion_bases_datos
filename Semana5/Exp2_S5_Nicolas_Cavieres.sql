@@ -1,9 +1,11 @@
+-- Habilita salida por consola para ver mensajes DBMS_OUTPUT.
 SET SERVEROUTPUT ON
 
 /* ============================================================
    BIND VARIABLE – AÑO DE EJECUCIÓN
    ============================================================ */
 VARIABLE b_anno NUMBER
+-- Solicita el año al usuario (SQL*Plus) y lo deja en la variable bind.
 EXEC :b_anno := &anno
 
 /* ============================================================
@@ -133,29 +135,36 @@ BEGIN
    /* ===============================
       AÑO Y RANGO DE FECHAS
       =============================== */
+   -- Año ingresado por el usuario.
    v_anno_input   := :b_anno;
+   -- Se procesa el año anterior al ingresado (regla del enunciado).
    v_anno_proceso := v_anno_input - 1;
 
+   -- Define rango [01-01, 01-01 del año siguiente) para filtrar por fecha.
    v_fecha_ini := DATE '2000-01-01' + NUMTOYMINTERVAL(v_anno_proceso - 2000, 'YEAR');
    v_fecha_fin := ADD_MONTHS(v_fecha_ini, 12);
 
    /* ===============================
       LIMPIEZA
       =============================== */
+   -- Se reinician tablas de trabajo para asegurar una corrida limpia.
    EXECUTE IMMEDIATE 'TRUNCATE TABLE detalle_aporte_sbif';
    EXECUTE IMMEDIATE 'TRUNCATE TABLE resumen_aporte_sbif';
    BEGIN
+      -- El log puede no existir o no estar permitido truncar; no detiene el proceso.
       EXECUTE IMMEDIATE 'TRUNCATE TABLE error_log';
    EXCEPTION
       WHEN OTHERS THEN
          NULL;
    END;
 
+   -- Punto de retorno: permite rollback parcial ante errores controlados.
    SAVEPOINT sp_proceso;
 
    /* ===============================
       CONTEO PREVIO
       =============================== */
+   -- Cuenta transacciones objetivo para validar consistencia vs. las procesadas.
    SELECT COUNT(*)
    INTO v_total_registros
    FROM transaccion_tarjeta_cliente tr
@@ -171,6 +180,7 @@ BEGIN
    /* ===============================
       PROCESO DETALLE
       =============================== */
+   -- Recorre transacciones del periodo y tipos definidos (Avance / Súper Avance).
    OPEN c_detalle;
    LOOP
       FETCH c_detalle INTO
@@ -185,17 +195,21 @@ BEGIN
 
       EXIT WHEN c_detalle%NOTFOUND;
 
+      -- Monto total: base + interés (si tasa viene NULL se considera 0).
       v_monto_total := ROUND(v_trx.monto_base * (1 + NVL(v_trx.tasa_interes, 0)));
 
+      -- Determina el tramo SBIF según monto total calculado.
       SELECT porc_aporte_sbif
       INTO v_porcentaje_sbif
       FROM tramo_aporte_sbif
       WHERE v_monto_total
             BETWEEN tramo_inf_av_sav AND tramo_sup_av_sav;
 
+      -- Aporte SBIF: porcentaje del monto total.
       v_aporte_sbif :=
          ROUND(v_monto_total * v_porcentaje_sbif / 100);
 
+      -- Inserta el detalle calculado para trazabilidad y posterior resumen.
       INSERT INTO detalle_aporte_sbif
       VALUES (
          v_trx.numrun,
@@ -212,10 +226,12 @@ BEGIN
    END LOOP;
    CLOSE c_detalle;
 
+      -- Validación: si no hay registros, se dispara excepción de negocio.
       IF v_total_registros = 0 THEN
          RAISE e_sin_transacciones;
       END IF;
 
+      -- Validación: el conteo procesado debe coincidir con el conteo esperado.
       IF v_procesados <> v_total_registros THEN
          RAISE e_diferencia_conteo;
       END IF;
@@ -226,6 +242,7 @@ BEGIN
       SELECT COUNT(*)
         INTO v_total_resumen
         FROM (
+                      -- Total de combinaciones (mes,año) y tipo que deben resumirse.
                SELECT DISTINCT TO_CHAR(fecha_transaccion, 'YYYYMM') AS yyyymm,
                                tipo_transaccion
                  FROM detalle_aporte_sbif
@@ -240,6 +257,7 @@ BEGIN
            FROM detalle_aporte_sbif
           ORDER BY TO_CHAR(fecha_transaccion, 'YYYYMM')
       ) LOOP
+         -- Cursor por mes (YYYYMM) para acumular montos por tipo en ese mes.
          OPEN c_resumen(r_mes.yyyymm);
 
          v_res_tipo_actual := NULL;
@@ -255,6 +273,7 @@ BEGIN
             END IF;
 
             IF v_res_tipo <> v_res_tipo_actual THEN
+               -- Cambio de tipo: guarda el acumulado del tipo anterior.
                INSERT INTO resumen_aporte_sbif
                VALUES (r_mes.mes_anno,
                        v_res_tipo_actual,
@@ -272,6 +291,7 @@ BEGIN
          END LOOP;
 
          IF v_res_tipo_actual IS NOT NULL THEN
+            -- Inserta el último tipo del mes (el loop inserta cuando detecta cambio).
             INSERT INTO resumen_aporte_sbif
             VALUES (r_mes.mes_anno,
                     v_res_tipo_actual,
@@ -284,9 +304,11 @@ BEGIN
       END LOOP;
 
       IF v_res_insertados <> v_total_resumen THEN
+         -- Validación final: se insertan exactamente todos los resúmenes esperados.
          RAISE e_diferencia_conteo;
       END IF;
 
+      -- Confirma todo el proceso si no hubo errores.
       COMMIT;
       DBMS_OUTPUT.PUT_LINE('COMMIT OK: Proceso finalizado correctamente.');
 
@@ -297,6 +319,7 @@ BEGIN
 
 EXCEPTION
    WHEN e_sin_transacciones THEN
+   -- Error de negocio: no se procesa nada, se registra en log.
       ROLLBACK TO sp_proceso;
       log_error(
          'e_sin_transacciones: No existen Avances/Súper Avances para el año ' || v_anno_proceso,
@@ -306,6 +329,7 @@ EXCEPTION
       DBMS_OUTPUT.PUT_LINE('ERROR: no existen transacciones para el año ' || v_anno_proceso);
 
    WHEN e_diferencia_conteo THEN
+      -- Error de control: diferencias entre esperados y procesados/insertados.
       ROLLBACK TO sp_proceso;
       log_error(
          'e_diferencia_conteo: detalle esp/proc=' || v_total_registros || '/' || v_procesados ||
@@ -316,16 +340,19 @@ EXCEPTION
       DBMS_OUTPUT.PUT_LINE('ERROR: diferencia entre registros esperados y procesados.');
 
    WHEN e_invalid_number THEN
+      -- Error típico por conversión implícita a número.
       ROLLBACK TO sp_proceso;
       log_error('e_invalid_number (ORA-01722)', SQLCODE, SQLERRM);
       DBMS_OUTPUT.PUT_LINE('ERROR: invalid number (ORA-01722).');
 
    WHEN NO_DATA_FOUND THEN
+      -- Puede ocurrir si no existe tramo SBIF para el monto calculado.
       ROLLBACK TO sp_proceso;
       log_error('NO_DATA_FOUND: sin tramo SBIF o datos faltantes', SQLCODE, SQLERRM);
       DBMS_OUTPUT.PUT_LINE('ERROR: no se encontró tramo SBIF (NO_DATA_FOUND).');
 
    WHEN OTHERS THEN
+      -- Cualquier otro error inesperado.
       ROLLBACK TO sp_proceso;
       log_error('OTHERS: error no controlado', SQLCODE, SQLERRM);
       DBMS_OUTPUT.PUT_LINE('ERROR NO CONTROLADO: ' || SQLERRM);
@@ -333,11 +360,14 @@ EXCEPTION
 END;
 /
 
+-- Consulta de verificación: detalle generado.
 SELECT * FROM DETALLE_APORTE_SBIF
 ORDER BY fecha_transaccion, numrun;
 
+-- Consulta de verificación: resumen por mes y tipo.
 SELECT * FROM RESUMEN_APORTE_SBIF
 ORDER BY TO_DATE(mes_anno, 'MMYYYY'), tipo_transaccion;
 
+-- Consulta de verificación: errores registrados durante la ejecución.
 SELECT * FROM ERROR_LOG
 ORDER BY fecha_error;
